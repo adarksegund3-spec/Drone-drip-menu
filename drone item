@@ -1,0 +1,1008 @@
+--[[
+    DRONE VISUAL | by: Angel
+    LuaU - Roblox - Delta Executor (script local / cliente)
+
+    - Ao executar: cria o item "Drone" na Hotbar (so o item, sem botao flutuante).
+    - Equipar o item: o drone aparece acima do personagem e voce o pilota.
+    - Desequipar o item: volta ao personagem original, no mesmo lugar.
+    - Voo: joystick/WASD (relativo a camera) + SUBIR/DESCER (ou E/Q). Camera livre normal do Roblox.
+
+    LIMITACAO: tudo e LOCAL. Outros jogadores nao veem o item nem o drone,
+    e jogos com anti-cheat podem bloquear Tool local / mudar WalkSpeed.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+local ENV = (getgenv and getgenv()) or _G
+local TAG = "DroneByAngel"
+local BIND = TAG .. "_Step"
+local rad, V, CF, ANG = math.rad, Vector3.new, CFrame.new, CFrame.Angles
+local MAT = Enum.Material
+
+local function log(...) print("[Drone|Angel]", ...) end
+local function warnf(...) warn("[Drone|Angel]", ...) end
+
+-- Evita execucao duplicada: encerra a instancia anterior
+if ENV.__DroneByAngel then
+    pcall(ENV.__DroneByAngel.Destroy)
+    ENV.__DroneByAngel = nil
+end
+
+----------------------------------------------------------------------
+-- CONFIG / CORES
+----------------------------------------------------------------------
+local CFG = {
+    speed = 45, climb = 24, accel = 4.5, brake = 3.2, turn = 6, tilt = 16,
+    radius = 1.9, spawnHeight = 3.5, riseTime = 0.45, riseSpeed = 7,
+    spinIdle = 40, spinMove = 52,
+}
+
+local C = {
+    black = Color3.fromRGB(22, 23, 26),
+    graphite = Color3.fromRGB(46, 49, 55),
+    dark = Color3.fromRGB(34, 36, 41),
+    plastic = Color3.fromRGB(30, 31, 36),
+    metal = Color3.fromRGB(112, 117, 125),
+    silver = Color3.fromRGB(186, 191, 198),
+    blue = Color3.fromRGB(0, 150, 255),
+    blueDim = Color3.fromRGB(20, 95, 160),
+    glass = Color3.fromRGB(8, 12, 20),
+    red = Color3.fromRGB(255, 70, 55),
+    green = Color3.fromRGB(70, 255, 140),
+    white = Color3.fromRGB(235, 240, 248),
+}
+
+local ARMS = { -- yaw do braco (graus), sentido da helice
+    { yaw = 45, dir = 1, front = true },
+    { yaw = -45, dir = -1, front = true },
+    { yaw = 135, dir = -1, front = false },
+    { yaw = -135, dir = 1, front = false },
+}
+local R = 3.55 -- distancia do motor ao centro
+
+----------------------------------------------------------------------
+-- ESTADO
+----------------------------------------------------------------------
+local S = {
+    active = false, d = nil, sv = nil, cons = {}, input = {},
+    vel = Vector3.zero, pos = Vector3.zero, yaw = 0, pitch = 0, roll = 0,
+    spin = 0, ang = 0, t0 = 0, tool = nil, rayParams = nil,
+}
+local G = { cons = {}, toolCons = {} }
+local ui
+local Notify
+local HOTBAR_SLOTS = 6 -- limite da hotbar deste jogo
+
+----------------------------------------------------------------------
+-- MODELO 3D (construido por codigo, sem IDs externos)
+----------------------------------------------------------------------
+local CTX -- contexto de construcao atual
+
+local function weldTo(root, part, rel)
+    local w = Instance.new("Weld")
+    w.Part0, w.Part1, w.C0 = root, part, rel
+    w.Parent = part
+    return w
+end
+
+local function basePart(name, size, color, mat)
+    local p = Instance.new("Part")
+    p.Name, p.Size, p.Color = name, size, color
+    p.Material = mat or MAT.SmoothPlastic
+    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = false, false, false, false
+    p.Massless, p.CastShadow = true, false
+    return p
+end
+
+local function add(root, name, size, offset, color, mat)
+    local p = basePart(name, size, color, mat)
+    p.CFrame = root.CFrame * offset
+    p.Parent = CTX.model
+    weldTo(root, p, offset)
+    table.insert(CTX.parts, p)
+    return p
+end
+
+local AX = {
+    X = CFrame.identity,
+    Y = CFrame.Angles(0, 0, math.pi / 2),
+    Z = CFrame.Angles(0, math.pi / 2, 0),
+}
+local function cyl(root, name, h, d, offset, color, mat, axis)
+    local p = add(root, name, V(h, d, d), offset * AX[axis or "Y"], color, mat)
+    p.Shape = Enum.PartType.Cylinder
+    return p
+end
+
+local function ball(root, name, d, offset, color, mat)
+    local p = add(root, name, V(d, d, d), offset, color, mat)
+    p.Shape = Enum.PartType.Ball
+    return p
+end
+
+local function screw(root, pos, d, yaw)
+    cyl(root, "Screw", 0.04, d, CF(pos + V(0, 0.02, 0)), C.silver, MAT.Metal, "Y")
+    add(root, "ScrewSlot", V(d * 0.8, 0.012, d * 0.16), CF(pos + V(0, 0.043, 0)) * ANG(0, yaw or 0, 0), C.black)
+end
+
+local function led(root, name, size, offset, color, blink)
+    local p = add(root, name, size, offset, color, MAT.Neon)
+    table.insert(CTX.leds, {
+        part = p, on = color, blink = blink,
+        off = color:Lerp(Color3.fromRGB(10, 10, 12), 0.85),
+    })
+    return p
+end
+
+local function CreateDroneBody()
+    local core = CTX.core
+    -- casco inferior com bordas arredondadas
+    add(core, "HullLower", V(1.75, 0.45, 3.0), CF(0, -0.15, 0), C.black)
+    for _, s in ipairs({ -1, 1 }) do
+        cyl(core, "HullEdge", 3.0, 0.45, CF(s * 0.875, -0.15, 0), C.black, nil, "Z")
+        cyl(core, "ShellEdge", 2.3, 0.36, CF(s * 0.77, 0.255, 0.15), C.graphite, nil, "Z")
+    end
+    -- casco superior + chanfros frontal/traseiro
+    add(core, "ShellUpper", V(1.54, 0.36, 2.3), CF(0, 0.255, 0.15), C.graphite)
+    add(core, "NoseChamfer", V(1.9, 0.28, 0.9), CF(0, 0.23, -1.2) * ANG(rad(-22), 0, 0), C.graphite)
+    add(core, "TailChamfer", V(1.9, 0.28, 0.7), CF(0, 0.25, 1.2) * ANG(rad(22), 0, 0), C.graphite)
+end
+
+local function CreateDroneArms()
+    local core = CTX.core
+    for _, a in ipairs(ARMS) do
+        local B = ANG(0, rad(a.yaw), 0)
+        local function A(x, y, z) return B * CF(x, y, z) end
+        add(core, "ArmBeam", V(0.46, 0.26, 2.7), A(0, 0, -2.35), C.plastic, MAT.Plastic)
+        add(core, "ArmCover", V(0.34, 0.1, 1.9), A(0, 0.18, -2.35), C.graphite)
+        add(core, "ArmRib", V(0.2, 0.12, 2.0), A(0, -0.19, -2.35), C.metal, MAT.Metal)
+        add(core, "ArmStripe", V(0.05, 0.012, 0.9), A(0, 0.236, -2.4), C.blueDim)
+        add(core, "ArmGusset", V(0.9, 0.36, 0.8), A(0, 0, -1.55), C.dark, MAT.Metal)
+        screw(core, A(0.2, 0.18, -1.4).Position, 0.12, rad(a.yaw))
+        screw(core, A(-0.2, 0.18, -1.7).Position, 0.12, rad(a.yaw))
+    end
+end
+
+local function CreateDroneMotors()
+    local core = CTX.core
+    for _, a in ipairs(ARMS) do
+        local B = ANG(0, rad(a.yaw), 0)
+        local function A(x, y, z) return B * CF(x, y, z) end
+        cyl(core, "MotorMountLow", 0.12, 0.75, A(0, -0.19, -R), C.dark, MAT.Metal)
+        cyl(core, "MotorPlate", 0.1, 1.05, A(0, 0.2, -R), C.metal, MAT.Metal)
+        cyl(core, "MotorHousing", 0.42, 0.82, A(0, 0.46, -R), C.dark, MAT.Metal)
+        cyl(core, "MotorRingSilver", 0.05, 0.88, A(0, 0.33, -R), C.silver, MAT.Metal)
+        cyl(core, "MotorRingBlue", 0.04, 0.86, A(0, 0.6, -R), C.blueDim)
+        cyl(core, "MotorCap", 0.1, 0.55, A(0, 0.72, -R), C.graphite)
+        cyl(core, "MotorShaft", 0.16, 0.16, A(0, 0.83, -R), C.silver, MAT.Metal)
+        for k = 0, 2 do
+            local t = k * 2 * math.pi / 3
+            screw(core, A(math.cos(t) * 0.42, 0.25, -R + math.sin(t) * 0.42).Position, 0.1, 0)
+        end
+    end
+end
+
+local function CreateDronePropellers()
+    local core = CTX.core
+    for _, a in ipairs(ARMS) do
+        local base = ANG(0, rad(a.yaw), 0) * CF(0, 0.95, -R)
+        local root = basePart("PropRoot", V(0.2, 0.2, 0.2), C.black)
+        root.Transparency = 1
+        root.CFrame = core.CFrame * base
+        root.Parent = CTX.model
+        local w = weldTo(core, root, base)
+        cyl(root, "PropHub", 0.14, 0.4, CF(0, 0, 0), C.dark, MAT.Metal)
+        cyl(root, "PropNut", 0.1, 0.2, CF(0, 0.09, 0), C.silver, MAT.Metal)
+        for _, s in ipairs({ 1, -1 }) do
+            add(root, "Blade", V(1.45, 0.035, 0.3), CF(s * 0.88, 0.01, 0) * ANG(s * rad(9), 0, 0), C.plastic, MAT.Plastic)
+            add(root, "BladeTip", V(0.4, 0.03, 0.2), CF(s * 1.66, 0.04, 0) * ANG(0, 0, s * rad(7)), C.blueDim, MAT.Plastic)
+        end
+        local disc = cyl(root, "PropDisc", 0.01, 3.7, CF(0, 0.03, 0), C.silver)
+        disc.Transparency = 1
+        table.insert(CTX.props, { weld = w, base = base, dir = a.dir, disc = disc })
+    end
+end
+
+local function CreateDroneCamera()
+    local core = CTX.core
+    add(core, "CamMount", V(0.9, 0.2, 0.7), CF(0, -0.42, -1.2), C.metal, MAT.Metal)
+    add(core, "CamBar", V(0.9, 0.08, 0.14), CF(0, -0.4, -1.65), C.dark, MAT.Metal)
+    for _, s in ipairs({ -1, 1 }) do
+        add(core, "GimbalPost", V(0.07, 0.5, 0.12), CF(s * 0.4, -0.62, -1.65), C.dark, MAT.Metal)
+        cyl(core, "PivotScrew", 0.03, 0.1, CF(s * 0.455, -0.62, -1.65), C.silver, MAT.Metal, "X")
+    end
+    add(core, "CamBody", V(0.56, 0.46, 0.5), CF(0, -0.62, -1.7), C.black)
+    ball(core, "CamBall", 0.5, CF(0, -0.62, -1.5), C.graphite)
+    cyl(core, "LensRing", 0.08, 0.5, CF(0, -0.62, -1.98), C.metal, MAT.Metal, "Z")
+    local glass = cyl(core, "LensGlass", 0.05, 0.38, CF(0, -0.62, -2.025), C.glass, MAT.Glass, "Z")
+    glass.Reflectance = 0.15
+    cyl(core, "LensInner", 0.055, 0.2, CF(0, -0.62, -2.03), Color3.fromRGB(4, 10, 28), MAT.Glass, "Z")
+end
+
+local function CreateDroneBattery()
+    local core = CTX.core
+    add(core, "Battery", V(1.3, 0.32, 1.5), CF(0, -0.5, 0.65), C.dark)
+    add(core, "BatteryPlate", V(1.2, 0.03, 1.35), CF(0, -0.675, 0.65), C.graphite)
+    for i = 0, 4 do
+        add(core, "BatteryVent", V(0.9, 0.01, 0.05), CF(0, -0.693, 0.2 + i * 0.22), C.black)
+    end
+    for _, s in ipairs({ -1, 1 }) do
+        add(core, "BatteryLatch", V(0.16, 0.14, 0.1), CF(s * 0.5, -0.5, 1.42), C.silver, MAT.Metal)
+    end
+end
+
+local function CreateDroneLights()
+    local core = CTX.core
+    -- frontais azuis
+    for _, s in ipairs({ -1, 1 }) do
+        led(core, "FrontLight", V(0.34, 0.07, 0.04), CF(s * 0.5, -0.08, -1.52), C.blue)
+    end
+    -- estado (topo)
+    led(core, "StatusGreen", V(0.1, 0.03, 0.1), CF(-0.25, 0.45, -0.75), C.green, true)
+    led(core, "StatusBlue", V(0.1, 0.03, 0.1), CF(0, 0.45, -0.75), C.blue)
+    led(core, "StatusWhite", V(0.1, 0.03, 0.1), CF(0.25, 0.45, -0.75), C.white)
+    -- sob os motores: azul na frente, vermelho atras
+    for _, a in ipairs(ARMS) do
+        led(core, "ArmLed", V(0.14, 0.04, 0.14), ANG(0, rad(a.yaw), 0) * CF(0, -0.15, -3.35), a.front and C.blue or C.red)
+    end
+    -- bateria (traseira)
+    local cols = { C.green, C.green, C.green, Color3.fromRGB(255, 170, 40) }
+    for i = 1, 4 do
+        led(core, "BatteryLed", V(0.08, 0.05, 0.03), CF(-0.3 + (i - 1) * 0.2, -0.43, 1.41), cols[i])
+    end
+end
+
+local function CreateDroneDetails()
+    local core = CTX.core
+    add(core, "TopPanel", V(1.2, 0.04, 1.1), CF(0, 0.455, 0.15), C.dark)
+    add(core, "PanelLineF", V(1.24, 0.016, 0.025), CF(0, 0.48, -0.4), C.black)
+    add(core, "PanelLineR", V(1.24, 0.016, 0.025), CF(0, 0.48, 0.7), C.black)
+    for _, s in ipairs({ -1, 1 }) do
+        add(core, "PanelLineS", V(0.025, 0.016, 1.1), CF(s * 0.6, 0.48, 0.15), C.black)
+        screw(core, V(s * 0.5, 0.475, -0.3), 0.1, 0)
+        screw(core, V(s * 0.5, 0.475, 0.6), 0.1, 0)
+        for i = 0, 4 do -- ranhuras de ventilacao
+            add(core, "Vent", V(0.02, 0.09, 0.07), CF(s * 0.952, 0.2, -0.4 + i * 0.22), C.black)
+        end
+        -- pernas de pouso
+        for _, z in ipairs({ -0.3, 1.0 }) do
+            add(core, "Leg", V(0.08, 0.5, 0.08), CF(s * 0.85, -0.62, z), C.plastic, MAT.Plastic)
+            add(core, "Foot", V(0.14, 0.06, 0.28), CF(s * 0.85, -0.9, z), C.black)
+        end
+    end
+    for i = 0, 2 do -- entrada de ar frontal
+        add(core, "Intake", V(0.5, 0.03, 0.03), CF(0, -0.15 - i * 0.07, -1.51), C.graphite)
+    end
+    add(core, "PortBody", V(0.36, 0.1, 0.06), CF(0, -0.6, 1.5), C.black)
+    add(core, "PortPins", V(0.22, 0.05, 0.04), CF(0, -0.6, 1.53), C.metal, MAT.Metal)
+end
+
+local function CreateDroneSignature()
+    local core = CTX.core
+    -- marca na TRASEIRA (e onde a camera fica atras do drone)
+    local panel = add(core, "SignRear", V(1.6, 0.5, 0.05), CF(0, -0.02, 1.525), C.black)
+    led(core, "SignTrimTop", V(1.6, 0.02, 0.055), CF(0, 0.245, 1.525), C.blue)
+    led(core, "SignTrimBottom", V(1.6, 0.02, 0.055), CF(0, -0.285, 1.525), C.blue)
+    local sg = Instance.new("SurfaceGui")
+    sg.Face, sg.Adornee = Enum.NormalId.Back, panel
+    sg.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+    sg.PixelsPerStud = 400
+    sg.LightInfluence, sg.AlwaysOnTop = 0, false
+    sg.Parent = panel
+    local function label(text, y, h, font, color)
+        local t = Instance.new("TextLabel")
+        t.BackgroundTransparency = 1
+        t.Position, t.Size = UDim2.fromScale(0, y), UDim2.fromScale(1, h)
+        t.Text, t.Font, t.TextScaled, t.TextColor3 = text, font, true, color
+        t.Parent = sg
+        return t
+    end
+    label("Criador:", 0.05, 0.28, Enum.Font.GothamBold, Color3.fromRGB(120, 190, 255))
+    local big = label("Angel", 0.33, 0.62, Enum.Font.GothamBlack, C.white)
+    big.TextStrokeColor3, big.TextStrokeTransparency = C.blue, 0.55
+    table.insert(CTX.guis, sg)
+end
+
+local function BuildDrone()
+    local model = Instance.new("Model")
+    model.Name = TAG .. "_Model"
+    local core = Instance.new("Part")
+    core.Name, core.Size, core.Transparency = "Core", V(1, 1, 1), 1
+    core.Anchored, core.CanCollide, core.CanQuery, core.CanTouch, core.CastShadow = true, false, false, false, false
+    core.Parent = model
+    model.PrimaryPart = core
+    CTX = { model = model, core = core, parts = {}, leds = {}, props = {}, guis = {} }
+    local ok, err = pcall(function()
+        CreateDroneBody()
+        CreateDroneArms()
+        CreateDroneMotors()
+        CreateDronePropellers()
+        CreateDroneCamera()
+        CreateDroneBattery()
+        CreateDroneLights()
+        CreateDroneDetails()
+        CreateDroneSignature()
+    end)
+    local ctx = CTX
+    CTX = nil
+    if not ok then
+        model:Destroy()
+        error("construcao do modelo falhou: " .. tostring(err))
+    end
+    return { model = model, core = core, parts = ctx.parts, leds = ctx.leds, props = ctx.props, guis = ctx.guis, hidden = false, blinkOn = true }
+end
+
+local function SetLeds(d, on)
+    for _, l in ipairs(d.leds) do
+        if l.part.Parent then
+            l.part.Color = on and l.on or l.off
+            l.part.Material = on and MAT.Neon or MAT.SmoothPlastic
+        end
+    end
+end
+
+local function Retire(d, spin)
+    if not d then return end
+    task.spawn(function()
+        SetLeds(d, false)
+        local t0, s, ang = os.clock(), spin or 30, S.ang
+        local conn
+        conn = RunService.Heartbeat:Connect(function(dt)
+            if not d.model.Parent then conn:Disconnect() return end
+            s = s * math.exp(-4 * dt)
+            ang = ang + s * dt
+            for _, p in ipairs(d.props) do
+                p.weld.C0 = p.base * ANG(0, ang * p.dir, 0)
+                p.disc.Transparency = 1 - 0.14 * math.clamp(s / 45, 0, 1)
+            end
+            if os.clock() - t0 > 1.2 then
+                conn:Disconnect()
+                d.model:Destroy()
+            end
+        end)
+    end)
+end
+
+----------------------------------------------------------------------
+-- UI (atualizacao)
+----------------------------------------------------------------------
+local function UpdateUI()
+    if not (ui and ui.gui and ui.gui.Parent) then return end
+    ui.panel.Visible = S.active
+    if not S.active and ui.reset then ui.reset() end
+end
+
+----------------------------------------------------------------------
+-- VOO
+----------------------------------------------------------------------
+local function sweep(pos, delta)
+    local dist, dir = delta.Magnitude, delta.Unit
+    local ok, res = pcall(Workspace.Spherecast, Workspace, pos, CFG.radius, dir * (dist + 0.05), S.rayParams)
+    if not ok then
+        res = Workspace:Raycast(pos, dir * (dist + CFG.radius), S.rayParams)
+        if res then res = { Distance = math.max(res.Distance - CFG.radius, 0), Normal = res.Normal } end
+    end
+    return res
+end
+
+-- o drone nao colide com nenhum jogador (nem personagens)
+local function playerFilter(d)
+    local list = { d.model }
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(list, pl.Character) end
+    end
+    return list
+end
+
+-- teleporta o personagem (parado) ate o chao embaixo do drone
+local function GoToDrone()
+    local sv = S.sv
+    if not (S.active and S.d and sv and sv.hrp.Parent) then return false end
+    local target = S.pos
+    local ok, res = pcall(function() return Workspace:Raycast(S.pos, V(0, -3000, 0), S.rayParams) end)
+    if ok and res then
+        target = res.Position + V(0, sv.hum.HipHeight + sv.hrp.Size.Y / 2 + 0.5, 0)
+    end
+    local rot = sv.hrp.CFrame - sv.hrp.CFrame.Position
+    sv.hrp.CFrame = CF(target) * rot
+    sv.hrp.AssemblyLinearVelocity = Vector3.zero
+    return true
+end
+
+local Retract -- declarado antes por causa do Step
+
+local function Step(dt)
+    local d, sv = S.d, S.sv
+    if not (d and sv and d.core.Parent and sv.hum.Parent and sv.hrp.Parent) then
+        error("drone ou personagem perdido")
+    end
+    local cam, core = sv.cam, d.core
+    if cam.CameraSubject ~= core then cam.CameraSubject = core end
+    if not sv.hrp.Anchored then sv.hrp.Anchored = true end
+
+    local now = os.clock()
+    local alive = now - S.t0
+    local mv = sv.hum.MoveDirection
+    local vert = ((S.input.keyUp or S.input.btnUp) and 1 or 0) - ((S.input.keyDown or S.input.btnDown) and 1 or 0)
+    local target = V(mv.X * CFG.speed, vert * CFG.climb, mv.Z * CFG.speed)
+    if alive < CFG.riseTime then target = target + V(0, CFG.riseSpeed, 0) end
+    local rate = target.Magnitude > 0.05 and CFG.accel or CFG.brake
+    S.vel = S.vel:Lerp(target, 1 - math.exp(-rate * dt))
+
+    -- movimento + colisao simples (desliza nas paredes)
+    local pos, delta = S.pos, S.vel * dt
+    local dist = delta.Magnitude
+    if dist > 1e-5 then
+        local hit = alive > CFG.riseTime and sweep(pos, delta) or nil
+        if hit and hit.Normal.Magnitude > 0.1 then
+            pos = pos + delta.Unit * math.min(math.max(hit.Distance - 0.03, 0), dist)
+            local into = S.vel:Dot(hit.Normal)
+            if into < 0 then S.vel = S.vel - hit.Normal * into end
+        else
+            pos = pos + delta
+        end
+    end
+    S.pos = pos
+
+    -- orientacao
+    local h = V(S.vel.X, 0, S.vel.Z)
+    local hs = h.Magnitude
+    if hs > 3 then
+        local ty = math.atan2(-h.X, -h.Z)
+        local diff = (ty - S.yaw + math.pi) % (2 * math.pi) - math.pi
+        S.yaw = S.yaw + diff * (1 - math.exp(-CFG.turn * dt))
+    end
+    local yawCF = ANG(0, S.yaw, 0)
+    local lv = yawCF:VectorToObjectSpace(S.vel)
+    local tp = rad(CFG.tilt) * math.clamp(lv.Z / CFG.speed, -1, 1)
+    local tr = -rad(CFG.tilt) * math.clamp(lv.X / CFG.speed, -1, 1)
+    local k = 1 - math.exp(-8 * dt)
+    S.pitch = S.pitch + (tp - S.pitch) * k
+    S.roll = S.roll + (tr - S.roll) * k
+    local bob = math.sin(now * 2.2) * 0.06
+    core.CFrame = CF(pos + V(0, bob, 0)) * yawCF * ANG(S.pitch, 0, S.roll)
+
+    -- helices (independentes do corpo)
+    local spinTarget = CFG.spinIdle + (CFG.spinMove - CFG.spinIdle) * math.clamp(S.vel.Magnitude / CFG.speed, 0, 1)
+    S.spin = S.spin + (spinTarget - S.spin) * (1 - math.exp(-2.5 * dt))
+    S.ang = (S.ang + S.spin * dt) % (2 * math.pi)
+    local blur = 1 - 0.14 * math.clamp(S.spin / 45, 0, 1)
+    for _, p in ipairs(d.props) do
+        p.weld.C0 = p.base * ANG(0, S.ang * p.dir, 0)
+        p.disc.Transparency = blur
+    end
+
+    -- LED de estado piscando
+    local on = (now % 1) < 0.5
+    if on ~= d.blinkOn then
+        d.blinkOn = on
+        for _, l in ipairs(d.leds) do
+            if l.blink then l.part.Color = on and l.on or l.off end
+        end
+    end
+
+    -- HUD (telemetria) + atualiza filtro de colisao (jogadores que entram/renascem)
+    if ui and ui.alt then
+        if ui.dot then ui.dot.BackgroundTransparency = 0.45 + 0.4 * math.sin(now * 5) end
+        if now - (S.hudT or 0) > 0.1 then
+            S.hudT = now
+            local base = sv.hrp.Position
+            ui.alt.Text = tostring(math.floor(pos.Y - base.Y + 0.5))
+            ui.spd.Text = tostring(math.floor(S.vel.Magnitude + 0.5))
+            ui.dst.Text = tostring(math.floor((pos - base).Magnitude + 0.5))
+        end
+    end
+    if now - (S.filtT or 0) > 1 then
+        S.filtT = now
+        S.rayParams.FilterDescendantsInstances = playerFilter(d)
+    end
+
+    -- primeira pessoa: esconde o modelo para nao ficar "dentro" dele
+    local near = (cam.CFrame.Position - core.Position).Magnitude < 2.2
+    if near ~= d.hidden then
+        d.hidden = near
+        for _, p in ipairs(d.parts) do p.LocalTransparencyModifier = near and 1 or 0 end
+        for _, g in ipairs(d.guis) do g.Enabled = not near end
+    end
+end
+
+Retract = function(reason)
+    if not S.active then return end
+    S.active = false
+    pcall(RunService.UnbindFromRenderStep, RunService, BIND)
+    for _, c in ipairs(S.cons) do pcall(c.Disconnect, c) end
+    table.clear(S.cons)
+    for key in pairs(S.input) do S.input[key] = false end
+
+    local sv, d = S.sv, S.d
+    S.sv, S.d = nil, nil
+    if sv then
+        pcall(function() sv.hrp.Anchored = sv.anchored end)
+        pcall(function()
+            local h = sv.hum
+            h.WalkSpeed, h.JumpPower, h.JumpHeight, h.AutoRotate = sv.walk, sv.jumpPower, sv.jumpHeight, sv.autoRotate
+        end)
+        pcall(function()
+            local hum = (LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")) or sv.hum
+            sv.cam.CameraSubject = hum
+            sv.cam.CameraType = sv.camType
+        end)
+    end
+    Retire(d, S.spin)
+    UpdateUI()
+    if #S.cons ~= 0 then warnf("conexoes restantes apos encerrar:", #S.cons) end
+    log("drone recolhido (" .. tostring(reason or "?") .. ")")
+end
+
+local function Launch()
+    if S.active then return end
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local cam = Workspace.CurrentCamera
+    if not (hum and hrp and cam and hum.Health > 0) then
+        warnf("personagem ou camera indisponivel")
+        return
+    end
+    local okB, d = pcall(BuildDrone)
+    if not okB then warnf("falha ao criar drone:", d) return end
+
+    S.active, S.d = true, d
+    S.sv = {
+        hum = hum, hrp = hrp, cam = cam,
+        walk = hum.WalkSpeed, jumpPower = hum.JumpPower, jumpHeight = hum.JumpHeight,
+        autoRotate = hum.AutoRotate, anchored = hrp.Anchored, camType = cam.CameraType,
+    }
+    local ok, err = pcall(function()
+        -- personagem parado no lugar
+        hum.WalkSpeed, hum.JumpPower, hum.JumpHeight, hum.AutoRotate = 0, 0, 0, false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.Anchored = true
+
+        local lv = hrp.CFrame.LookVector
+        S.yaw = math.atan2(-lv.X, -lv.Z)
+        S.pos = hrp.Position + V(0, CFG.spawnHeight, 0)
+        S.vel, S.pitch, S.roll, S.spin, S.t0 = Vector3.zero, 0, 0, 0, os.clock()
+        d.model:PivotTo(CF(S.pos) * ANG(0, S.yaw, 0))
+        d.model.Parent = Workspace
+        SetLeds(d, true)
+
+        S.rayParams = RaycastParams.new()
+        S.rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        S.rayParams.FilterDescendantsInstances = playerFilter(d)
+
+        if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+        cam.CameraSubject = d.core
+
+        table.insert(S.cons, hum.Died:Connect(function() Retract("morreu") end))
+        table.insert(S.cons, UIS.InputBegan:Connect(function(i)
+            if UIS:GetFocusedTextBox() then return end
+            local kc = i.KeyCode
+            if kc == Enum.KeyCode.E or kc == Enum.KeyCode.Space then S.input.keyUp = true
+            elseif kc == Enum.KeyCode.Q or kc == Enum.KeyCode.LeftControl then S.input.keyDown = true end
+        end))
+        table.insert(S.cons, UIS.InputEnded:Connect(function(i)
+            local kc = i.KeyCode
+            if kc == Enum.KeyCode.E or kc == Enum.KeyCode.Space then S.input.keyUp = false
+            elseif kc == Enum.KeyCode.Q or kc == Enum.KeyCode.LeftControl then S.input.keyDown = false end
+        end))
+
+        RunService:BindToRenderStep(BIND, Enum.RenderPriority.Camera.Value - 1, function(dt)
+            local good, e = xpcall(Step, function(m) return debug.traceback(tostring(m)) end, dt)
+            if not good then
+                warnf("erro durante o voo:", e)
+                Retract("erro")
+            end
+        end)
+        UpdateUI()
+    end)
+    if not ok then
+        warnf("falha ao iniciar pilotagem:", err)
+        Retract("falha ao iniciar")
+        return
+    end
+    log("drone ativo")
+end
+
+----------------------------------------------------------------------
+-- ITEM "Drone" NO INVENTARIO
+----------------------------------------------------------------------
+-- tenta colocar o item na hotbar; se estiver cheia, manda a ultima ferramenta da hotbar para a mochila
+local function placeTool(tool, bp, char)
+    local others, equipped = {}, 0
+    for _, c in ipairs(bp:GetChildren()) do
+        if c:IsA("Tool") and c ~= tool then table.insert(others, c) end
+    end
+    if char then
+        for _, c in ipairs(char:GetChildren()) do
+            if c:IsA("Tool") then equipped += 1 end
+        end
+    end
+    if #others + equipped < HOTBAR_SLOTS then
+        return pcall(function() tool.Parent = bp end)
+    end
+    local victim = others[math.min(math.max(HOTBAR_SLOTS - equipped, 1), #others)]
+    if not victim then return pcall(function() tool.Parent = bp end) end
+    local ok = pcall(function()
+        victim.Parent = nil
+        tool.Parent = bp
+    end)
+    pcall(function() victim.Parent = bp end) -- sempre devolve a ferramenta (vai para a mochila)
+    return ok and tool.Parent == bp, victim.Name
+end
+
+local function MakeTool()
+    for _, c in ipairs(G.toolCons) do pcall(c.Disconnect, c) end
+    table.clear(G.toolCons)
+    local bp = LP:FindFirstChildOfClass("Backpack") or LP:WaitForChild("Backpack", 5)
+    if not bp then warnf("Backpack nao encontrado") return nil end
+    for _, holder in ipairs({ bp, LP.Character }) do -- sem copias duplicadas
+        if holder then
+            for _, t in ipairs(holder:GetChildren()) do
+                if t:IsA("Tool") and t:GetAttribute(TAG) then t:Destroy() end
+            end
+        end
+    end
+    local okT, tool = pcall(function()
+        local t = Instance.new("Tool")
+        t.Name, t.RequiresHandle, t.CanBeDropped, t.ToolTip = "Drone", false, false, "Drone | by: Angel"
+        t:SetAttribute(TAG, true)
+        return t
+    end)
+    if not okT or not tool then warnf("falha ao criar o item:", tool) return nil end
+
+    local inHotbar, moved = placeTool(tool, bp, LP.Character)
+    if not tool.Parent then pcall(function() tool.Parent = bp end) end
+    if not tool.Parent then
+        warnf("item nao pode ser adicionado ao inventario")
+        pcall(tool.Destroy, tool)
+        return nil
+    end
+    table.insert(G.toolCons, tool.Equipped:Connect(function() Launch() end))
+    table.insert(G.toolCons, tool.Unequipped:Connect(function() Retract("item") end))
+    S.tool = tool
+    log("item 'Drone' criado", inHotbar and "(hotbar)" or "(mochila)")
+    if Notify then
+        if not inHotbar then
+            Notify("Inventário cheio", "O item está na sua mochila!")
+        elseif moved then
+            Notify("Hotbar cheia", moved .. " foi para a mochila", "info")
+        end
+    end
+    return tool
+end
+
+----------------------------------------------------------------------
+-- INTERFACE (botao flutuante arrastavel + controles de voo)
+----------------------------------------------------------------------
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function guiContainers()
+    local list = {}
+    if gethui then local ok, h = pcall(gethui) if ok and h then table.insert(list, h) end end
+    table.insert(list, game:GetService("CoreGui"))
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if pg then table.insert(list, pg) end
+    return list
+end
+
+local function makeDraggable(frame)
+    local dragging, dragInput, startInput, startPos
+    table.insert(G.cons, frame.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, startInput, startPos = true, i.Position, frame.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end))
+    table.insert(G.cons, frame.InputChanged:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+            dragInput = i
+        end
+    end))
+    table.insert(G.cons, UIS.InputChanged:Connect(function(i)
+        if dragging and i == dragInput then
+            local dl = i.Position - startInput
+            local vp = (Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) or V(800, 400, 0)
+            local x = math.clamp(startPos.X.Offset + dl.X, 0, math.max(vp.X - frame.AbsoluteSize.X, 0))
+            local y = math.clamp(startPos.Y.Offset + dl.Y, 0, math.max(vp.Y - frame.AbsoluteSize.Y, 0))
+            frame.Position = UDim2.fromOffset(x, y)
+        end
+    end))
+end
+
+local function holdButton(btn, key, onState)
+    local function isPress(i)
+        return i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1
+    end
+    local function set(v)
+        S.input[key] = v
+        if onState then onState(v) end
+    end
+    table.insert(G.cons, btn.InputBegan:Connect(function(i)
+        if isPress(i) then
+            set(true)
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then set(false) end
+            end)
+        end
+    end))
+    table.insert(G.cons, btn.InputEnded:Connect(function(i)
+        if isPress(i) then set(false) end
+    end))
+end
+
+local UI_BASE = Color3.fromRGB(24, 30, 44)
+local UI_HOT = Color3.fromRGB(0, 110, 205)
+local TXT_DIM = Color3.fromRGB(190, 203, 224)
+
+local function chevron(parent, up)
+    local box = new("Frame", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.new(0.5, 0, 0, 7), Size = UDim2.fromOffset(20, 12),
+    }, parent)
+    for _, side in ipairs({ -1, 1 }) do
+        local bar = new("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(10 + side * 4.6, 6),
+            Size = UDim2.fromOffset(11, 3), BackgroundColor3 = C.blue, BorderSizePixel = 0,
+            Rotation = (up and 1 or -1) * side * 32,
+        }, box)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
+    end
+end
+
+local function fitText(label, maxSize)
+    label.TextScaled = true
+    new("UITextSizeConstraint", { MaxTextSize = maxSize }, label)
+end
+
+local function BuildUI()
+    local gui = new("ScreenGui", {
+        Name = TAG .. "_UI", ResetOnSpawn = false, IgnoreGuiInset = true,
+        DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    local parented = false
+    for _, p in ipairs(guiContainers()) do
+        if pcall(function() gui.Parent = p end) and gui.Parent then parented = true break end
+    end
+    if not parented then error("nao foi possivel colocar a interface na tela") end
+
+    local vp = (Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) or V(800, 400, 0)
+    local PW, PH = 104, 152
+    local panel = new("Frame", {
+        Name = "Voo", Position = UDim2.fromOffset(math.max(vp.X - PW - 60, 0), math.floor(vp.Y * 0.08)),
+        Size = UDim2.fromOffset(PW, PH), Visible = false, Active = true,
+        BackgroundColor3 = Color3.fromRGB(22, 28, 40), BackgroundTransparency = 0.05, BorderSizePixel = 0,
+    }, gui)
+    new("UICorner", { CornerRadius = UDim.new(0, 12) }, panel)
+    new("UIStroke", { Color = C.blue, Thickness = 1.5, Transparency = 0.35 }, panel)
+    new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(105, 110, 125)), Rotation = 90 }, panel)
+
+    local function line(y)
+        new("Frame", {
+            Position = UDim2.fromOffset(8, y), Size = UDim2.new(1, -16, 0, 1),
+            BackgroundColor3 = C.blue, BackgroundTransparency = 0.65, BorderSizePixel = 0,
+        }, panel)
+    end
+
+    -- cabecalho: ponto pulsante, estado e barras de sinal
+    local dot = new("Frame", {
+        Position = UDim2.fromOffset(9, 7), Size = UDim2.fromOffset(7, 7),
+        BackgroundColor3 = C.green, BorderSizePixel = 0,
+    }, panel)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(20, 2), Size = UDim2.fromOffset(60, 17),
+        Text = "DRONE ATIVO", Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = C.green,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
+    for i = 1, 4 do
+        local h = 2 + i * 2
+        new("Frame", {
+            Position = UDim2.fromOffset(PW - 28 + (i - 1) * 5, 15 - h), Size = UDim2.fromOffset(3, h),
+            BackgroundColor3 = C.green, BackgroundTransparency = i == 4 and 0.6 or 0, BorderSizePixel = 0,
+        }, panel)
+    end
+    line(21)
+
+    -- telemetria (3 celulas)
+    local function stat(idx, label)
+        local cell = new("Frame", {
+            Position = UDim2.fromOffset(8 + (idx - 1) * 30.5, 25), Size = UDim2.fromOffset(27, 28),
+            BackgroundColor3 = Color3.fromRGB(10, 14, 22), BorderSizePixel = 0,
+        }, panel)
+        new("UICorner", { CornerRadius = UDim.new(0, 6) }, cell)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 2), Size = UDim2.new(1, 0, 0, 9),
+            Text = label, Font = Enum.Font.GothamBold, TextSize = 7, TextColor3 = Color3.fromRGB(110, 128, 152),
+        }, cell)
+        return new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 11), Size = UDim2.new(1, 0, 0, 15),
+            Text = "0", Font = Enum.Font.GothamBlack, TextSize = 12, TextColor3 = C.white,
+        }, cell)
+    end
+    local alt, spd, dst = stat(1, "ALT"), stat(2, "VEL"), stat(3, "DIST")
+    line(57)
+
+    -- subir / descer lado a lado
+    local resetters = {}
+    local function flyBtn(text, x, key, up)
+        local b = new("TextButton", {
+            Text = "", Position = UDim2.fromOffset(x, 62), Size = UDim2.fromOffset(41, 42),
+            BackgroundColor3 = UI_BASE, BorderSizePixel = 0, AutoButtonColor = false,
+        }, panel)
+        new("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+        local st = new("UIStroke", { Color = C.blue, Thickness = 1.5, Transparency = 0.4 }, b)
+        new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 155, 170)), Rotation = 90 }, b)
+        chevron(b, up)
+        local lbl = new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(2, 26), Size = UDim2.new(1, -4, 0, 11),
+            Text = text, Font = Enum.Font.GothamBold, TextColor3 = TXT_DIM,
+        }, b)
+        fitText(lbl, 9)
+        local function vis(on)
+            b.BackgroundColor3 = on and UI_HOT or UI_BASE
+            st.Transparency = on and 0 or 0.4
+            lbl.TextColor3 = on and Color3.new(1, 1, 1) or TXT_DIM
+        end
+        table.insert(resetters, function() vis(false) end)
+        holdButton(b, key, vis)
+    end
+    flyBtn("SUBIR", 8, "btnUp", true)
+    flyBtn("DESCER", 55, "btnDown", false)
+
+    -- ir para o drone
+    local tp = new("TextButton", {
+        Text = "IR PARA O DRONE", Font = Enum.Font.GothamBold, TextColor3 = Color3.new(1, 1, 1),
+        Position = UDim2.fromOffset(8, 109), Size = UDim2.fromOffset(PW - 16, 26),
+        BackgroundColor3 = Color3.fromRGB(0, 95, 185), BorderSizePixel = 0, AutoButtonColor = true,
+    }, panel)
+    fitText(tp, 10)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, tp)
+    new("UICorner", { CornerRadius = UDim.new(0, 8) }, tp)
+    new("UIStroke", { Color = Color3.fromRGB(120, 190, 255), Thickness = 1, Transparency = 0.45 }, tp)
+    new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(140, 150, 175)), Rotation = 90 }, tp)
+    table.insert(G.cons, tp.Activated:Connect(function()
+        if GoToDrone() and Notify then Notify("Teleportado", "Você está no drone", "info") end
+    end))
+
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 138), Size = UDim2.new(1, -8, 0, 12),
+        Text = "criado por: Angel", Font = Enum.Font.GothamBold, TextSize = 8,
+        TextColor3 = Color3.fromRGB(150, 165, 188),
+    }, panel)
+    makeDraggable(panel)
+
+    return {
+        gui = gui, panel = panel, dot = dot, alt = alt, spd = spd, dst = dst,
+        reset = function() for _, f in ipairs(resetters) do f() end end,
+    }
+end
+
+-- notificacao lateral: entra deslizando, fica alguns segundos e sai para fora da tela
+Notify = function(title, text, kind, dur)
+    if not (ui and ui.gui and ui.gui.Parent) then return end
+    dur = dur or 5.6
+    local old = ui.gui:FindFirstChild("Notificacao")
+    if old then old:Destroy() end
+    local W, H = 272, 68
+    local AMBER = (kind == "info") and C.blue or Color3.fromRGB(255, 176, 46)
+    local card = new("Frame", {
+        Name = "Notificacao", AnchorPoint = Vector2.new(1, 0), Size = UDim2.fromOffset(W, H),
+        Position = UDim2.new(1, W + 24, 0.08, 0), BackgroundColor3 = Color3.fromRGB(16, 20, 29),
+        BackgroundTransparency = 0.04, BorderSizePixel = 0, ClipsDescendants = true,
+    }, ui.gui)
+    new("UICorner", { CornerRadius = UDim.new(0, 14) }, card)
+    new("UIStroke", { Color = AMBER, Thickness = 1.2, Transparency = 0.45 }, card)
+    new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(120, 125, 140)), Rotation = 90 }, card)
+    local icon = new("Frame", {
+        Position = UDim2.fromOffset(12, 14), Size = UDim2.fromOffset(38, 38),
+        BackgroundColor3 = (kind == "info") and Color3.fromRGB(12, 34, 60) or Color3.fromRGB(46, 36, 16), BorderSizePixel = 0,
+    }, card)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, icon)
+    new("UIStroke", { Color = AMBER, Thickness = 1.5, Transparency = 0.2 }, icon)
+    new("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Text = (kind == "info") and "i" or "!",
+        Font = Enum.Font.GothamBlack, TextSize = 22, TextColor3 = AMBER,
+    }, icon)
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(62, 11), Size = UDim2.new(1, -72, 0, 20),
+        Text = title, Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = Color3.new(1, 1, 1),
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(62, 32), Size = UDim2.new(1, -72, 0, 18),
+        Text = text, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Color3.fromRGB(170, 182, 200),
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    local bar = new("Frame", {
+        AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, 3),
+        BackgroundColor3 = AMBER, BorderSizePixel = 0,
+    }, card)
+
+    task.spawn(function()
+        local tin = TweenService:Create(card, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Position = UDim2.new(1, -14, 0.08, 0) })
+        tin:Play()
+        tin.Completed:Wait()
+        TweenService:Create(bar, TweenInfo.new(dur, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 0, 3) }):Play()
+        task.wait(dur)
+        if not card.Parent then return end
+        local tout = TweenService:Create(card, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
+            { Position = UDim2.new(1, W + 24, 0.08, 0) })
+        tout:Play()
+        tout.Completed:Wait()
+        if card.Parent then card:Destroy() end
+    end)
+end
+
+----------------------------------------------------------------------
+-- DIAGNOSTICO / ENCERRAMENTO GLOBAL
+----------------------------------------------------------------------
+local function Diag()
+    local models = 0
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m.Name == TAG .. "_Model" then models += 1 end
+    end
+    log("ativo:", S.active, "| conexoes de voo:", #S.cons,
+        "| UI:", ui ~= nil and ui.gui.Parent ~= nil,
+        "| item:", S.tool ~= nil and S.tool.Parent ~= nil,
+        "| modelos no Workspace:", models)
+end
+
+local function DestroyAll()
+    Retract("destroy")
+    for _, c in ipairs(G.cons) do pcall(c.Disconnect, c) end
+    for _, c in ipairs(G.toolCons) do pcall(c.Disconnect, c) end
+    table.clear(G.cons)
+    table.clear(G.toolCons)
+    if S.tool then pcall(S.tool.Destroy, S.tool) end
+    if ui and ui.gui then pcall(ui.gui.Destroy, ui.gui) end
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m.Name == TAG .. "_Model" then m:Destroy() end
+    end
+    ENV.__DroneByAngel = nil
+end
+
+----------------------------------------------------------------------
+-- INICIALIZACAO
+----------------------------------------------------------------------
+-- limpa restos de execucoes antigas
+pcall(function()
+    for _, p in ipairs(guiContainers()) do
+        local old = p:FindFirstChild(TAG .. "_UI")
+        if old then old:Destroy() end
+    end
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m.Name == TAG .. "_Model" then m:Destroy() end
+    end
+end)
+
+local okUI, errUI = pcall(function() ui = BuildUI() end)
+if not okUI then warnf("falha ao criar a interface:", errUI) end
+
+task.spawn(function()
+    if not MakeTool() then warnf("item 'Drone' nao disponivel neste jogo") end
+end)
+
+table.insert(G.cons, LP.CharacterRemoving:Connect(function() Retract("respawn") end))
+table.insert(G.cons, LP.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    MakeTool()
+end))
+
+ENV.__DroneByAngel = { Destroy = DestroyAll, Diag = Diag }
+UpdateUI()
+log("pronto. Equipe o item 'Drone' na Hotbar.")
+Diag()
